@@ -1557,20 +1557,26 @@ fn openDocumentHandler(server: *Server, _: std.mem.Allocator, notification: type
 fn changeDocumentHandler(server: *Server, arena: std.mem.Allocator, notification: types.DidChangeTextDocumentParams) Error!void {
     const handle = server.document_store.getHandle(notification.textDocument.uri) orelse return;
 
-    var auto_insert_semicolon = false;
+    var should_attempt_auto_insert_semicolon = false;
     var insert_semicolon_position: types.Position = undefined;
 
     if (server.config.auto_insert_semicolon) {
         for (notification.contentChanges) |change| {
             switch (change) {
                 .literal_0 => |content_change| {
+                    // Only consider changes that are purely newline insertions
                     if (std.mem.eql(u8, content_change.text, "\n") or std.mem.eql(u8, content_change.text, "\r\n")) {
-                        const line_num = content_change.range.start.line;
+                        const line_of_newline_insertion = content_change.range.start.line;
+                        const char_of_newline_insertion = content_change.range.start.character;
 
-                        if (try checkForSemicolonError(server, handle, line_num)) |semicolon_pos| {
-                            auto_insert_semicolon = true;
-                            insert_semicolon_position = semicolon_pos;
-                            break;
+                        // Check for semicolon error on the line *before* this newline contentChange is applied
+                        if (try checkForSemicolonError(server, handle, line_of_newline_insertion)) |ideal_semicolon_pos_on_line| {
+                            // Ensure the newline is inserted at or after the ideal semicolon position
+                            if (ideal_semicolon_pos_on_line.character <= char_of_newline_insertion) {
+                                should_attempt_auto_insert_semicolon = true;
+                                insert_semicolon_position = ideal_semicolon_pos_on_line;
+                                break; // Found a candidate, exit contentChanges loop
+                            }
                         }
                     }
                 },
@@ -1592,14 +1598,15 @@ fn changeDocumentHandler(server: *Server, arena: std.mem.Allocator, notification
 
     try server.document_store.refreshDocument(handle.uri, new_text);
 
-    if (auto_insert_semicolon) {
-        try autoInsertSemicolon(server, handle, insert_semicolon_position, arena);
+    var sent_semicolon_edit = false;
+    if (should_attempt_auto_insert_semicolon) {
+        sent_semicolon_edit = try autoInsertSemicolon(server, handle, insert_semicolon_position, arena);
     }
 
-    if (server.client_capabilities.supports_publish_diagnostics) {
-        try server.pushJob(.{
-            .generate_diagnostics = try server.allocator.dupe(u8, handle.uri),
-        });
+    // If a semicolon edit was sent, the client will apply it and send a new textDocument/didChange.
+    // That new didChange will trigger diagnostics. Pushing diagnostics here would be on an intermediate state.
+    if (!sent_semicolon_edit and server.client_capabilities.supports_publish_diagnostics) {
+        try server.pushJob(.{ .generate_diagnostics = try server.allocator.dupe(u8, handle.uri) });
     }
 }
 
@@ -1976,8 +1983,8 @@ fn checkForSemicolonError(server: *Server, handle: *DocumentStore.Handle, line_n
     return null;
 }
 
-fn autoInsertSemicolon(server: *Server, handle: *DocumentStore.Handle, position: types.Position, arena: std.mem.Allocator) Error!void {
-    if (!server.client_capabilities.supports_apply_edits) return;
+fn autoInsertSemicolon(server: *Server, handle: *DocumentStore.Handle, position: types.Position, arena: std.mem.Allocator) Error!bool {
+    if (!server.client_capabilities.supports_apply_edits) return false;
 
     const text_edit = types.TextEdit{
         .range = .{
@@ -2000,6 +2007,7 @@ fn autoInsertSemicolon(server: *Server, handle: *DocumentStore.Handle, position:
         },
     );
     server.allocator.free(json_message);
+    return true;
 }
 
 const HandledRequestParams = union(enum) {
