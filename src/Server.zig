@@ -1557,34 +1557,6 @@ fn openDocumentHandler(server: *Server, _: std.mem.Allocator, notification: type
 fn changeDocumentHandler(server: *Server, arena: std.mem.Allocator, notification: types.DidChangeTextDocumentParams) Error!void {
     const handle = server.document_store.getHandle(notification.textDocument.uri) orelse return;
 
-    var should_attempt_auto_insert_semicolon = false;
-    var insert_semicolon_position: types.Position = undefined;
-
-    if (server.config.auto_insert_semicolon) {
-        for (notification.contentChanges) |change| {
-            switch (change) {
-                .literal_0 => |content_change| {
-                    // Only consider changes that are purely newline insertions
-                    if (std.mem.eql(u8, content_change.text, "\n") or std.mem.eql(u8, content_change.text, "\r\n")) {
-                        const line_of_newline_insertion = content_change.range.start.line;
-                        const char_of_newline_insertion = content_change.range.start.character;
-
-                        // Check for semicolon error on the line *before* this newline contentChange is applied
-                        if (try checkForSemicolonError(server, handle, line_of_newline_insertion)) |ideal_semicolon_pos_on_line| {
-                            // Ensure the newline is inserted at or after the ideal semicolon position
-                            if (ideal_semicolon_pos_on_line.character <= char_of_newline_insertion) {
-                                should_attempt_auto_insert_semicolon = true;
-                                insert_semicolon_position = ideal_semicolon_pos_on_line;
-                                break; // Found a candidate, exit contentChanges loop
-                            }
-                        }
-                    }
-                },
-                .literal_1 => {},
-            }
-        }
-    }
-
     const new_text = try diff.applyContentChanges(server.allocator, handle.tree.source, notification.contentChanges, server.offset_encoding);
 
     if (new_text.len > DocumentStore.max_document_size) {
@@ -1599,12 +1571,32 @@ fn changeDocumentHandler(server: *Server, arena: std.mem.Allocator, notification
     try server.document_store.refreshDocument(handle.uri, new_text);
 
     var sent_semicolon_edit = false;
-    if (should_attempt_auto_insert_semicolon) {
-        sent_semicolon_edit = try autoInsertSemicolon(server, handle, insert_semicolon_position, arena);
+    if (server.config.auto_insert_semicolon) {
+        for (notification.contentChanges) |change_in_notification| {
+            switch (change_in_notification) {
+                .literal_0 => |incremental_change| {
+                    if (std.mem.eql(u8, incremental_change.text, "\n") or std.mem.eql(u8, incremental_change.text, "\r\n")) {
+                        const line_where_newline_was_inserted = incremental_change.range.start.line;
+                        const char_offset_of_newline_insertion = incremental_change.range.start.character;
+
+                        if (try checkForSemicolonError(server, handle, line_where_newline_was_inserted)) |ideal_semicolon_pos_on_line| {
+                            if (ideal_semicolon_pos_on_line.character <= char_offset_of_newline_insertion) {
+                                sent_semicolon_edit = try autoInsertSemicolon(server, handle, ideal_semicolon_pos_on_line, arena);
+                                if (sent_semicolon_edit) {
+                                    break;
+                                }
+                            }
+                        }
+                    }
+                },
+                .literal_1 => {},
+            }
+            if (sent_semicolon_edit) {
+                break;
+            }
+        }
     }
 
-    // If a semicolon edit was sent, the client will apply it and send a new textDocument/didChange.
-    // That new didChange will trigger diagnostics. Pushing diagnostics here would be on an intermediate state.
     if (!sent_semicolon_edit and server.client_capabilities.supports_publish_diagnostics) {
         try server.pushJob(.{ .generate_diagnostics = try server.allocator.dupe(u8, handle.uri) });
     }
