@@ -87,6 +87,11 @@
             "type": "boolean",
             "default": false
         },
+        "auto_insert_semicolon": {
+            "description": "Automatically insert semicolons when creating a new line after a declaration with missing semicolon",
+            "type": "boolean",
+            "default": true
+        },
         "highlight_global_var_declarations": {
             "description": "Whether to highlight global var declarations",
             "type": "boolean",

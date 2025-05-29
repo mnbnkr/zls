@@ -1554,8 +1554,30 @@ fn openDocumentHandler(server: *Server, _: std.mem.Allocator, notification: type
     }
 }
 
-fn changeDocumentHandler(server: *Server, _: std.mem.Allocator, notification: types.DidChangeTextDocumentParams) Error!void {
+fn changeDocumentHandler(server: *Server, arena: std.mem.Allocator, notification: types.DidChangeTextDocumentParams) Error!void {
     const handle = server.document_store.getHandle(notification.textDocument.uri) orelse return;
+
+    var auto_insert_semicolon = false;
+    var insert_semicolon_position: types.Position = undefined;
+
+    if (server.config.auto_insert_semicolon) {
+        for (notification.contentChanges) |change| {
+            switch (change) {
+                .literal_0 => |content_change| {
+                    if (std.mem.eql(u8, content_change.text, "\n") or std.mem.eql(u8, content_change.text, "\r\n")) {
+                        const line_num = content_change.range.start.line;
+
+                        if (try checkForSemicolonError(server, handle, line_num)) |semicolon_pos| {
+                            auto_insert_semicolon = true;
+                            insert_semicolon_position = semicolon_pos;
+                            break;
+                        }
+                    }
+                },
+                .literal_1 => {},
+            }
+        }
+    }
 
     const new_text = try diff.applyContentChanges(server.allocator, handle.tree.source, notification.contentChanges, server.offset_encoding);
 
@@ -1569,6 +1591,10 @@ fn changeDocumentHandler(server: *Server, _: std.mem.Allocator, notification: ty
     }
 
     try server.document_store.refreshDocument(handle.uri, new_text);
+
+    if (auto_insert_semicolon) {
+        try autoInsertSemicolon(server, handle, insert_semicolon_position, arena);
+    }
 
     if (server.client_capabilities.supports_publish_diagnostics) {
         try server.pushJob(.{
@@ -1921,6 +1947,59 @@ fn selectionRangeHandler(server: *Server, arena: std.mem.Allocator, request: typ
     const handle = server.document_store.getHandle(request.textDocument.uri) orelse return null;
 
     return try selection_range.generateSelectionRanges(arena, handle, request.positions, server.offset_encoding);
+}
+
+fn checkForSemicolonError(server: *Server, handle: *DocumentStore.Handle, line_num: u32) Error!?types.Position {
+    var error_bundle = try diagnostics_gen.getAstCheckDiagnostics(server, handle);
+    defer error_bundle.deinit(server.allocator);
+
+    if (error_bundle.errorMessageCount() == 0) return null;
+
+    for (error_bundle.getMessages()) |msg_index| {
+        const err = error_bundle.getErrorMessage(msg_index);
+        const message = error_bundle.nullTerminatedString(err.msg);
+
+        if (std.mem.indexOf(u8, message, "expected ';' after declaration") != null) {
+            if (err.src_loc == .none) continue;
+            const src_loc = error_bundle.getSourceLocation(err.src_loc);
+            const error_position = offsets.indexToPosition(handle.tree.source, src_loc.span_start, server.offset_encoding);
+
+            if (error_position.line == line_num) {
+                return types.Position{
+                    .line = line_num,
+                    .character = error_position.character,
+                };
+            }
+        }
+    }
+
+    return null;
+}
+
+fn autoInsertSemicolon(server: *Server, handle: *DocumentStore.Handle, position: types.Position, arena: std.mem.Allocator) Error!void {
+    if (!server.client_capabilities.supports_apply_edits) return;
+
+    const text_edit = types.TextEdit{
+        .range = .{
+            .start = position,
+            .end = position,
+        },
+        .newText = ";",
+    };
+
+    var workspace_edit: types.WorkspaceEdit = .{ .changes = .{} };
+    const edit_array = try arena.dupe(types.TextEdit, &.{text_edit});
+    try workspace_edit.changes.?.map.putNoClobber(arena, handle.uri, edit_array);
+
+    const json_message = try server.sendToClientRequest(
+        .{ .string = "apply_edit" },
+        "workspace/applyEdit",
+        types.ApplyWorkspaceEditParams{
+            .label = "Auto-insert semicolon",
+            .edit = workspace_edit,
+        },
+    );
+    server.allocator.free(json_message);
 }
 
 const HandledRequestParams = union(enum) {

@@ -57,6 +57,9 @@ force_autofix: bool = false,
 /// Enables warnings for style guideline mismatches
 warn_style: bool = false,
 
+// Automatically insert semicolons when creating a new line after a declaration with missing semicolon
+auto_insert_semicolon: bool = true,
+
 /// Whether to highlight global var declarations
 highlight_global_var_declarations: bool = false,
 
